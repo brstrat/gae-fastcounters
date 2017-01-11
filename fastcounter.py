@@ -8,7 +8,6 @@ idempotent and would double-count if ran extra time(s).  However, this should
 be rather exceptional based on App Engine's documentation.
 """
 import logging
-import random
 
 from google.appengine.api import memcache
 from google.appengine.api.taskqueue import taskqueue
@@ -17,41 +16,56 @@ from google.appengine.ext import db, webapp
 __all__ = ['get_count', 'get_counts', 'incr']
 
 
+VALUE_PREFIX = 'counter:value:'
+LOCK_PREFIX = 'counter:lock:'
+PENDING_PREFIX = 'counter:pending:'
+
+
 class Counter(db.Model):
     """Persistent storage of a counter's values"""
     # key_name is the counter's name
     value = db.IntegerProperty(indexed=False)
+
+    @classmethod
+    def kind(self):
+        return 'memcache_counter'
 
 
 def get_count(name):
     """Returns the count of the specified counter name.
 
     If it doesn't exist, 0 is returned.  For counters which do exist, the
-    returned count includes both the persisted (datastore) count plus the
-    unpersisted memcache count.  It does not include any count waiting to be
-    persisted on the task queue.
+    returned count includes the persisted (datastore) count plus the
+    unpersisted memcache count plus any count waiting in the task queue.
     """
-    c = Counter.get_by_key_name(name)
-    fmc = int(memcache.get("ctr_val:" + name) or BASE_VALUE) - BASE_VALUE
-    if c:
-        return c.value + fmc
+    counter = Counter.get_by_key_name(name)
+    from_cache = int(memcache.get(VALUE_PREFIX + name) or BASE_VALUE) - BASE_VALUE
+    pending = int(memcache.get(PENDING_PREFIX + name) or BASE_VALUE) - BASE_VALUE
+    if counter:
+        return counter.value + from_cache + pending
     else:
-        return fmc
+        return from_cache + pending
 
 
-def get_counts(names):
+def get_counts(names, from_db=True, from_memcache=True):
     """Like get_count, but fetches multiple counts at once which is much
     more efficient than getting them one at a time.
     """
-    db_keys = [db.Key.from_path('Counter', name) for name in names]
-    db_counts = db.get(db_keys)
-    mc_counts = memcache.get_multi(names, 'ctr_val:')
-    ret = []
-    for i, name in enumerate(names):
-        db_count = (db_counts[i] and db_counts[i].value) or 0
-        mc_count = int(mc_counts.get(name, BASE_VALUE)) - BASE_VALUE
-        ret.append(db_count + mc_count)
-    return ret
+    if from_db:
+        db_keys = [db.Key.from_path(Counter.kind(), name) for name in names]
+        db_counters = db.get(db_keys)
+        db_counts = [(db_counter and db_counter.value) or 0 for db_counter in db_counters]
+    else:
+        db_counts = [0 for name in names]
+
+    if from_memcache:
+        mc_counters = memcache.get_multi(names, VALUE_PREFIX)
+        mc_counts = [int(mc_counters.get(name, BASE_VALUE)) - BASE_VALUE for name in names]
+    else:
+        mc_counts = [0 for name in names]
+
+    return [sum(counts) for counts in zip(db_counts, mc_counts)]
+
 
 # Memcache incr/decr only works on 64-bit *unsigned* integers, and it
 # does not underflow.  By starting the memcache count at half of the
@@ -70,8 +84,8 @@ def incr(name, delta=1, update_interval=10):
       update_interval: Approximate interval, in seconds, between updates.  Must
                        be greater than zero.
     """
-    lock_key = "ctr_lck:" + name
-    delta_key = "ctr_val:" + name
+    lock_key = LOCK_PREFIX + name
+    delta_key = VALUE_PREFIX + name
 
     # update memcache
     if delta >= 0:
@@ -81,18 +95,15 @@ def incr(name, delta=1, update_interval=10):
 
     if memcache.add(lock_key, None, time=update_interval):
         # time to enqueue a new task to persist the counter
-        # note: cast to int on next line is due to GAE issue 2012
-        # (http://code.google.com/p/googleappengine/issues/detail?id=2012)
-        v = int(v)
         delta_to_persist = v - BASE_VALUE
         if delta_to_persist == 0:
             return  # nothing to save
 
         try:
-            qn = random.randint(0, 4)
-            qname = 'PersistCounter%d' % qn
-            taskqueue.add(url='/task/counter_persist_incr',
-                          queue_name=qname,
+            pending_key = PENDING_PREFIX + name
+            memcache.set(pending_key, v, time=update_interval)
+            taskqueue.add(url='/tasks/persist_memcache_counter',
+                          queue_name='memcache-counter',
                           params=dict(name=name,
                                       delta=delta_to_persist))
         except:
@@ -113,12 +124,12 @@ def incr(name, delta=1, update_interval=10):
                          name, delta_to_persist)
 
 
-class CounterPersistIncr(webapp.RequestHandler):
+class PersistMemcacheCounter(webapp.RequestHandler):
     """Task handler for incrementing the datastore's counter value."""
     def post(self):
         name = self.request.get('name')
         delta = int(self.request.get('delta'))
-        db.run_in_transaction(CounterPersistIncr.incr_counter, name, delta)
+        db.run_in_transaction(PersistMemcacheCounter.incr_counter, name, delta)
 
     @staticmethod
     def incr_counter(name, delta):
@@ -128,3 +139,7 @@ class CounterPersistIncr(webapp.RequestHandler):
         else:
             c.value += delta
         c.put()
+        memcache.delete(PENDING_PREFIX + name)
+
+
+application = webapp.WSGIApplication([(".*", PersistMemcacheCounter)], debug=True)
